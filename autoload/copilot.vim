@@ -801,3 +801,7 @@ function! AcceptSingleWord()
 endfunction
 
 imap <script><expr> <S-Tab> AcceptSingleWord()
+
+let g:copilot_filetypes = {
+   \ 'markdown': v:true,
+   \ }
