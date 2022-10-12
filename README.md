@@ -1,3 +1,46 @@
+# Copilot-One-Word.vim
+This is a fork of the Neovim plugin for GitHub Copilot with the added feature of being able to add a single word at a time by pressing the shift and tab keys together.
+
+## Getting started
+
+1.  Install [Neovim][] or the latest patch of [Vim][] (9.0.0185 or newer).
+
+2.  Install [Node.js][] version 16.  (Other versions should work too, except
+    Node 18 which isn't supported yet.)
+
+3.  Install `github/copilot.vim` using vim-plug, packer.nvim, or any other
+    plugin manager.  Or to install manually, run one of the following
+    commands:
+
+    * Vim, Linux/macOS:
+
+          git clone https://github.com/m4ttm/copilot.vim.git \
+            ~/.vim/pack/github/start/copilot.vim
+
+    * Neovim, Linux/macOS:
+
+          git clone https://github.com/m4ttm/copilot.vim.git \
+            ~/.config/nvim/pack/github/start/copilot.vim
+
+    * Vim, Windows (PowerShell command):
+
+          git clone https://github.com/m4ttm/copilot.vim.git `
+            $HOME/vimfiles/pack/github/start/copilot.vim
+
+    * Neovim, Windows (PowerShell command):
+
+          git clone https://github.com/m4ttm/copilot.vim.git `
+            $HOME/AppData/Local/nvim/pack/github/start/copilot.vim
+
+4.  Start Neovim and invoke `:Copilot setup`.
+
+[Node.js]: https://nodejs.org/en/download/
+[Neovim]: https://github.com/neovim/neovim/releases/latest
+[Vim]: https://github.com/vim/vim
+
+Suggestions are displayed inline and can be accepted by pressing the tab key.
+See `:help copilot` for more information.
+
 # Copilot.vim
 
 GitHub Copilot uses OpenAI Codex to suggest code and entire functions in

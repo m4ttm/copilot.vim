@@ -457,6 +457,8 @@ function! copilot#TextQueuedForInsertion() abort
   endtry
 endfunction
 
+
+
 function! copilot#Accept(...) abort
   let s = copilot#GetDisplayedSuggestion()
   if !empty(s.text)
@@ -791,3 +793,11 @@ function! copilot#Command(line1, line2, range, bang, mods, arg) abort
     return 'echoerr ' . string(v:exception)
   endtry
 endfunction
+
+function! AcceptSingleWord()
+    let suggestion = copilot#Accept("")
+    let bar = copilot#TextQueuedForInsertion()
+    return split(bar, '[ .]\zs')[0]
+endfunction
+
+imap <script><expr> <S-Tab> AcceptSingleWord()
