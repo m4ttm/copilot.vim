@@ -794,14 +794,16 @@ function! copilot#Command(line1, line2, range, bang, mods, arg) abort
   endtry
 endfunction
 
-function! AcceptSingleWord()
+function! copilot#AcceptWord()
     let suggestion = copilot#Accept("")
     let bar = copilot#TextQueuedForInsertion()
     return split(bar, '[ .]\zs')[0]
 endfunction
 
-imap <script><expr> <S-Tab> AcceptSingleWord()
-imap <script><expr> <C-Tab> AcceptSingleWord()
+function! copilot#AcceptCharacter()
+    let suggestion = copilot#Accept("")
+    let bar = copilot#TextQueuedForInsertion()
+    return split(bar, '[ .]\zs')[0][0]
 
 let g:copilot_filetypes = {
    \ 'markdown': v:true,
