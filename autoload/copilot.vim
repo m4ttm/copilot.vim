@@ -804,6 +804,7 @@ function! copilot#AcceptCharacter()
     let suggestion = copilot#Accept("")
     let bar = copilot#TextQueuedForInsertion()
     return split(bar, '[ .]\zs')[0][0]
+endfunction
 
 let g:copilot_filetypes = {
    \ 'markdown': v:true,
