@@ -40,6 +40,7 @@ function! s:MapTab() abort
       exe 'imap <silent><nowait><expr>         <Tab> copilot#Accept(' . tab_fallback . ')'
     endif
   endif
+  imap <script><silent><nowait><expr> <S-Tab> copilot#AcceptWord()
 endfunction
 
 function! s:Event(type) abort
