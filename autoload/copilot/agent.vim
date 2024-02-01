@@ -1,11 +1,6 @@
-if exists('g:autoloaded_copilot_agent')
-  finish
-endif
-let g:autoloaded_copilot_agent = 1
-
 scriptencoding utf-8
 
-let s:plugin_version = '1.6.1'
+let s:plugin_version = copilot#version#String()
 
 let s:error_exit = -1
 
@@ -44,18 +39,31 @@ function! s:LogSend(request, line) abort
   return '--> ' . a:line
 endfunction
 
-let s:chansend = function(exists('*chansend') ? 'chansend' : 'ch_sendraw')
+function! s:RejectRequest(request, error) abort
+  if a:request.status ==# 'canceled'
+    return
+  endif
+  let a:request.waiting = {}
+  call remove(a:request, 'resolve')
+  let reject = remove(a:request, 'reject')
+  let a:request.status = 'error'
+  let a:request.error = a:error
+  for Cb in reject
+    let a:request.waiting[timer_start(0, function('s:Callback', [a:request, 'error', Cb]))] = 1
+  endfor
+endfunction
+
 function! s:Send(agent, request) abort
-  let request = extend({'jsonrpc': '2.0'}, a:request, 'keep')
-  let body = json_encode(request)
-  call s:chansend(a:agent.job, "Content-Length: " . len(body) . "\r\n\r\n" . body)
-  call copilot#logger#Trace(function('s:LogSend', [request, body]))
-  return request
+  try
+    call ch_sendexpr(a:agent.job, a:request)
+    return v:true
+  catch /^Vim\%((\a\+)\)\=:E631:/
+    return v:false
+  endtry
 endfunction
 
 function! s:AgentNotify(method, params) dict abort
-  call s:Send(self, {'method': a:method, 'params': a:params})
-  return v:true
+  return s:Send(self, {'method': a:method, 'params': a:params})
 endfunction
 
 function! s:RequestWait() dict abort
@@ -73,7 +81,7 @@ function! s:RequestAwait() dict abort
   if has_key(self, 'result')
     return self.result
   endif
-  throw 'copilot#agent(' . self.error.code . '): ' . self.error.message
+  throw 'Copilot:E' . self.error.code . ': ' . self.error.message
 endfunction
 
 function! s:RequestAgent() dict abort
@@ -117,10 +125,85 @@ function! s:SetUpRequest(agent, id, method, params, ...) abort
   return request
 endfunction
 
+function! s:UrlEncode(str) abort
+  return substitute(iconv(a:str, 'latin1', 'utf-8'),'[^A-Za-z0-9._~!$&''()*+,;=:@/-]','\="%".printf("%02X",char2nr(submatch(0)))','g')
+endfunction
+
+let s:slash = exists('+shellslash') ? '\' : '/'
+function! s:UriFromBufnr(bufnr) abort
+  let absolute = tr(bufname(a:bufnr), s:slash, '/')
+  if absolute !~# '^\a\+:\|^/\|^$' && getbufvar(a:bufnr, 'buftype') =~# '^\%(nowrite\)\=$'
+    let absolute = substitute(tr(getcwd(), s:slash, '/'), '/\=$', '/', '') . absolute
+  endif
+  if has('win32') && absolute =~# '^\a://\@!'
+    return 'file:///' . strpart(absolute, 0, 2) . s:UrlEncode(strpart(absolute, 2))
+  elseif absolute =~# '^/'
+    return 'file://' . s:UrlEncode(absolute)
+  elseif absolute =~# '^\a[[:alnum:].+-]*:\|^$'
+    return absolute
+  else
+    return ''
+  endif
+endfunction
+
+function! s:BufferText(bufnr) abort
+  return join(getbufline(a:bufnr, 1, '$'), "\n") . "\n"
+endfunction
+
+function! s:LogMessage(params) abort
+  call copilot#logger#Raw(get(a:params, 'level', 3), get(a:params, 'message', ''))
+endfunction
+
+function! s:ShowMessageRequest(params) abort
+  let choice = inputlist([a:params.message . "\n\nRequest Actions:"] +
+        \ map(copy(get(a:params, 'actions', [])), { i, v -> (i + 1) . '. ' . v.title}))
+  return choice > 0 ? get(a:params.actions, choice - 1, v:null) : v:null
+endfunction
+
+function! s:SendRequest(agent, request) abort
+  if empty(s:Send(a:agent, a:request)) && has_key(a:agent.requests, a:request.id)
+    call s:RejectRequest(remove(a:agent.requests, a:request.id), {'code': 257, 'message': 'Write failed'})
+  endif
+endfunction
+
 function! s:AgentRequest(method, params, ...) dict abort
   let s:id += 1
-  let request = {'method': a:method, 'params': a:params, 'id': s:id}
-  call s:Send(self, request)
+  let request = {'method': a:method, 'params': deepcopy(a:params), 'id': s:id}
+  for doc in filter([get(request.params, 'doc', {}), get(request.params, 'textDocument',{})], 'type(get(v:val, "uri", "")) == v:t_number')
+    let bufnr = doc.uri
+    let doc.uri = s:UriFromBufnr(doc.uri)
+    let uri = doc.uri
+    let languageId = copilot#doc#LanguageForFileType(getbufvar(bufnr, '&filetype'))
+    let doc_version = getbufvar(bufnr, 'changedtick')
+    if has_key(self.open_buffers, bufnr) && (
+          \ self.open_buffers[bufnr].uri !=# doc.uri ||
+          \ self.open_buffers[bufnr].languageId !=# languageId)
+      call remove(self.open_buffers, bufnr)
+      sleep 1m
+    endif
+    if !has_key(self.open_buffers, bufnr)
+      let td_item = {
+            \ 'uri': doc.uri,
+            \ 'version': doc_version,
+            \ 'languageId': languageId,
+            \ 'text': s:BufferText(bufnr)}
+      call self.Notify('textDocument/didOpen', {'textDocument': td_item})
+      let self.open_buffers[bufnr] = {
+            \ 'uri': doc.uri,
+            \ 'version': doc_version,
+            \ 'languageId': languageId}
+    else
+      let vtd_id = {
+            \ 'uri': doc.uri,
+            \ 'version': doc_version}
+      call self.Notify('textDocument/didChange', {
+            \ 'textDocument': vtd_id,
+            \ 'contentChanges': [{'text': s:BufferText(bufnr)}]})
+      let self.open_buffers[bufnr].version = doc_version
+    endif
+    let doc.version = doc_version
+  endfor
+  call timer_start(0, { _ -> s:SendRequest(self, request) })
   return call('s:SetUpRequest', [self, s:id, a:method, a:params] + a:000)
 endfunction
 
@@ -152,45 +235,39 @@ function! s:RequestCancel() dict abort
   return self
 endfunction
 
-function! s:DispatchMessage(agent, handler, id, params, ...) abort
+function! s:DispatchMessage(agent, method, handler, id, params, ...) abort
   try
     let response = {'result': call(a:handler, [a:params])}
+    if response.result is# 0
+      let response.result = v:null
+    endif
   catch
-    call copilot#logger#Exception()
+    call copilot#logger#Exception('lsp.request.' . a:method)
     let response = {'error': {'code': -32000, 'message': v:exception}}
   endtry
   if !empty(a:id)
     call s:Send(a:agent, extend({'id': a:id}, response))
   endif
+  return response
 endfunction
 
 function! s:OnMessage(agent, body, ...) abort
-  call copilot#logger#Trace({ -> '<-- ' . a:body})
-  let response = json_decode(a:body)
-  if type(response) != v:t_dict
-    return
+  if !has_key(a:body, 'method')
+    return s:OnResponse(a:agent, a:body)
   endif
-  return s:OnResponse(a:agent, response)
+  let request = a:body
+  let id = get(request, 'id', v:null)
+  let params = get(request, 'params', v:null)
+  if has_key(a:agent.methods, request.method)
+    return s:DispatchMessage(a:agent, request.method, a:agent.methods[request.method], id, params)
+  elseif !empty(id)
+    call s:Send(a:agent, {"id": id, "error": {"code": -32700, "message": "Method not found: " . request.method}})
+  endif
 endfunction
 
 function! s:OnResponse(agent, response, ...) abort
   let response = a:response
-  let id = get(response, 'id', v:null)
-  if has_key(response, 'method')
-    let params = get(response, 'params', v:null)
-    if empty(id)
-      if has_key(a:agent.notifications, response.method)
-        call timer_start(0, { _ -> a:agent.notifications[response.method](params) })
-      elseif response.method ==# 'LogMessage'
-        call copilot#logger#Raw(get(params, 'level', 3), get(params, 'message', ''))
-      endif
-    elseif has_key(a:agent.methods, response.method)
-      call timer_start(0, function('s:DispatchMessage', [a:agent, a:agent.methods[response.method], id, params]))
-    else
-      return s:Send(a:agent, {"id": id, "error": {"code": -32700, "message": "Method not found: " . response.method}})
-    endif
-    return
-  endif
+  let id = get(a:response, 'id', v:null)
   if !has_key(a:agent.requests, id)
     return
   endif
@@ -216,44 +293,11 @@ function! s:OnResponse(agent, response, ...) abort
   endif
 endfunction
 
-function! s:OnOut(agent, state, data) abort
-  let a:state.buffer .= a:data
-  while 1
-    if a:state.mode ==# 'body'
-      let content_length = a:state.headers['content-length']
-      if strlen(a:state.buffer) >= content_length
-        let headers = remove(a:state, 'headers')
-        let a:state.mode = 'headers'
-        let a:state.headers = {}
-        let body = strpart(a:state.buffer, 0, content_length)
-        let a:state.buffer = strpart(a:state.buffer, content_length)
-        call timer_start(0, function('s:OnMessage', [a:agent, body]))
-      else
-        return
-      endif
-    elseif a:state.mode ==# 'headers' && a:state.buffer =~# "\n"
-      let line = matchstr(a:state.buffer, "^.[^\n]*")
-      let a:state.buffer = strpart(a:state.buffer, strlen(line) + 1)
-      let match = matchlist(line, '^\([^:]\+\): \(.\{-\}\)\r$')
-      if len(match)
-        let a:state.headers[tolower(match[1])] = match[2]
-      elseif line =~# "^\r\\=$"
-        let a:state.mode = 'body'
-      else
-        call copilot#logger#Error("Invalid header: " . line)
-        call a:agent.Close()
-      endif
-    else
-      return
-    endif
-  endwhile
-endfunction
-
-function! s:OnErr(agent, line) abort
+function! s:OnErr(agent, line, ...) abort
   call copilot#logger#Debug('<-! ' . a:line)
 endfunction
 
-function! s:OnExit(agent, code) abort
+function! s:OnExit(agent, code, ...) abort
   let a:agent.exit_status = a:code
   if has_key(a:agent, 'job')
     call remove(a:agent, 'job')
@@ -261,20 +305,9 @@ function! s:OnExit(agent, code) abort
   if has_key(a:agent, 'client_id')
     call remove(a:agent, 'client_id')
   endif
+  let code = a:code < 0 || a:code > 255 ? 256 : a:code
   for id in sort(keys(a:agent.requests), { a, b -> +a > +b })
-    let request = remove(a:agent.requests, id)
-    if request.status ==# 'canceled'
-      return
-    endif
-    let request.waiting = {}
-    call remove(request, 'resolve')
-    let reject = remove(request, 'reject')
-    let request.status = 'error'
-    let code = a:code < 0 || a:code > 255 ? 256 : a:code
-    let request.error = {'code': code, 'message': 'Agent exited', 'data': {'status': a:code}}
-    for Cb in reject
-      let request.waiting[timer_start(0, function('s:Callback', [request, 'error', Cb]))] = 1
-    endfor
+    call s:RejectRequest(remove(a:agent.requests, id), {'code': code, 'message': 'Agent exited', 'data': {'status': a:code}})
   endfor
   call timer_start(0, { _ -> get(s:instances, a:agent.id) is# a:agent ? remove(s:instances, a:agent.id) : {} })
   call copilot#logger#Info('agent exited with status ' . a:code)
@@ -304,13 +337,12 @@ function! copilot#agent#LspResponse(agent_id, opts, ...) abort
 endfunction
 
 function! s:LspRequest(method, params, ...) dict abort
-  let id = v:lua.require'_copilot'.lsp_request(self.id, a:method, a:params)
+  let id = eval("v:lua.require'_copilot'.lsp_request(self.id, a:method, a:params)")
   if id isnot# v:null
     return call('s:SetUpRequest', [self, id, a:method, a:params] + a:000)
   endif
   if has_key(self, 'client_id')
     call copilot#agent#LspExit(self.client_id, -1, -1)
-    unlet! self.client_id
   endif
   throw 'copilot#agent: LSP client not available'
 endfunction
@@ -323,33 +355,39 @@ function! s:LspClose() dict abort
 endfunction
 
 function! s:LspNotify(method, params) dict abort
-  return v:lua.require'_copilot'.rpc_notify(self.id, a:method, a:params)
+  return eval("v:lua.require'_copilot'.rpc_notify(self.id, a:method, a:params)")
 endfunction
 
-function! copilot#agent#LspHandle(agent_id, response) abort
+function! copilot#agent#LspHandle(agent_id, request) abort
   if !has_key(s:instances, a:agent_id)
     return
   endif
-  call s:OnResponse(s:instances[a:agent_id], a:response)
+  return s:OnMessage(s:instances[a:agent_id], a:request)
 endfunction
 
-unlet! s:is_arm_macos
-function! s:IsArmMacOS() abort
-  if exists('s:is_arm_macos')
-    return s:is_arm_macos
-  elseif has('win32') || !isdirectory('/private')
-    let s:is_arm_macos = 0
-  else
-    let out = []
-    call copilot#job#Stream(['uname', '-s', '-p'], function('add', [out]), v:null)
-    let s:is_arm_macos = join(out, '') =~# '^Darwin arm'
+function! s:GetNodeVersion(command) abort
+  let out = []
+  let err = []
+  let status = copilot#job#Stream(a:command + ['--version'], function('add', [out]), function('add', [err]))
+  let string = matchstr(join(out, ''), '^v\zs\d\+\.[^[:space:]]*')
+  if status != 0
+    let string = ''
   endif
-  return s:is_arm_macos
+  let major = str2nr(string)
+  let minor = str2nr(matchstr(string, '\.\zs\d\+'))
+  return {'status': status, 'string': string, 'major': major, 'minor': minor}
 endfunction
 
 function! s:Command() abort
-  if !has('nvim-0.6') && v:version < 802
+  if !has('nvim-0.6') && v:version < 900
     return [v:null, '', 'Vim version too old']
+  endif
+  let agent = get(g:, 'copilot_agent_command', '')
+  if empty(agent) || !filereadable(agent)
+    let agent = s:root . '/dist/agent.js'
+    if !filereadable(agent)
+      return [v:null, '', 'Could not find dist/agent.js (bad install?)']
+    endif
   endif
   let node = get(g:, 'copilot_node_command', '')
   if empty(node)
@@ -364,32 +402,31 @@ function! s:Command() abort
       return [v:null, '', 'Node.js executable `' . get(node, 0, '') . "' not found"]
     endif
   endif
-  let out = []
-  let err = []
-  let status = copilot#job#Stream(node + ['--version'], function('add', [out]), function('add', [err]))
-  if status != 0
-    return [v:null, '', 'Node.js exited with status ' . status]
+  if get(g:, 'copilot_ignore_node_version')
+    return [node + [agent, '--stdio'], '', '']
   endif
-  let node_version = matchstr(join(out, ''), '^v\zs\d\+\.[^[:space:]]*')
-  let major = str2nr(node_version)
-  let too_new = major >= 18
+  let node_version = s:GetNodeVersion(node)
+  let warning = ''
+  if node_version.major < 18 && get(node, 0, '') !=# 'node' && executable('node')
+    let node_version_from_path = s:GetNodeVersion(['node'])
+    if node_version_from_path.major >= 18
+      let warning = 'Ignoring g:copilot_node_command: Node.js ' . node_version.string . ' is end-of-life'
+      let node = ['node']
+      let node_version = node_version_from_path
+    endif
+  endif
+  if node_version.status != 0
+    return [v:null, '', 'Node.js exited with status ' . node_version.status]
+  endif
   if !get(g:, 'copilot_ignore_node_version')
-    if major == 0
-      return [v:null, node_version, 'Could not determine Node.js version']
-    elseif (major < 16 || too_new) && s:IsArmMacOS()
-      return [v:null, node_version, 'Node.js version 16.x or 17.x required on Apple Silicon but found ' . node_version]
-    elseif major < 12 || too_new
-      return [v:null, node_version, 'Node.js version 12.x–17.x required but found ' . node_version]
+    if node_version.major == 0
+      return [v:null, node_version.string, 'Could not determine Node.js version']
+    elseif node_version.major < 16 || node_version.major == 16 && node_version.minor < 14 || node_version.major == 17 && node_version.minor < 3
+      " 16.14+ and 17.3+ still work for now, but are end-of-life
+      return [v:null, node_version.string, 'Node.js version 18.x or newer required but found ' . node_version.string]
     endif
   endif
-  let agent = get(g:, 'copilot_agent_command', '')
-  if empty(agent) || !filereadable(agent)
-    let agent = s:root . '/copilot/dist/agent.js'
-    if !filereadable(agent)
-      return [v:null, node_version, 'Could not find agent.js (bad install?)']
-    endif
-  endif
-  return [node + [agent], node_version, '']
+  return [node + [agent, '--stdio'], node_version.string, warning]
 endfunction
 
 function! s:UrlDecode(str) abort
@@ -412,21 +449,30 @@ function! copilot#agent#EditorInfo() abort
   else
     let proxy = ''
   endif
-  let match = matchlist(proxy, '\C^\%([^:]\+://\)\=\%(\([^/:#]\+@\)\)\=\%(\([^/:#]\+\)\|\[\([[:xdigit:]:]\+\)\]\)\%(:\(\d\+\)\)\=\%(/\|$\)')
+  let match = matchlist(proxy, '\c^\%([^:]\+://\)\=\%(\([^/#]\+@\)\)\=\%(\([^/:#]\+\)\|\[\([[:xdigit:]:]\+\)\]\)\%(:\(\d\+\)\)\=\%(/\|$\|?strict_\=ssl=\(.*\)\)')
   if !empty(match)
     let info.networkProxy = {'host': match[2] . match[3], 'port': empty(match[4]) ? 80 : +match[4]}
-    if !empty(match[1])
-      let info.networkProxy.username = s:UrlDecode(matchstr(match[1], '^[^:]*'))
-      let info.networkProxy.password = s:UrlDecode(matchstr(match[1], ':\zs.*'))
+    if match[5] =~? '^[0f]'
+      let info.networkProxy.rejectUnauthorized = v:false
+    elseif match[5] =~? '^[1t]'
+      let info.networkProxy.rejectUnauthorized = v:true
+    elseif exists('g:copilot_proxy_strict_ssl')
+      let info.networkProxy.rejectUnauthorized = empty(g:copilot_proxy_strict_ssl) ? v:false : v:true
     endif
+    if !empty(match[1])
+      let info.networkProxy.username = s:UrlDecode(matchstr(match[1], '^[^:@]*'))
+      let info.networkProxy.password = s:UrlDecode(matchstr(match[1], ':\zs[^@]*'))
+    endif
+  endif
+  if type(get(g:, 'copilot_auth_provider_url')) == v:t_string
+    let info.authProvider = {'url': g:copilot_auth_provider_url}
   endif
   return info
 endfunction
 
 function! s:GetCapabilitiesResult(result, agent) abort
   let a:agent.capabilities = get(a:result, 'capabilities', {})
-  let info = deepcopy(copilot#agent#EditorInfo())
-  let info.editorInfo.version .= ' + Node.js ' . a:agent.node_version
+  let info = copilot#agent#EditorInfo()
   call a:agent.Request('setEditorInfo', extend({'editorConfiguration': a:agent.editorConfiguration}, info))
 endfunction
 
@@ -440,10 +486,10 @@ function! s:GetCapabilitiesError(error, agent) abort
 endfunction
 
 function! s:AgentStartupError() dict abort
-  while has_key(self, 'job') && !has_key(self, 'startup_error') && !has_key(self, 'capabilities')
+  while (has_key(self, 'job') || has_key(self, 'client_id')) && !has_key(self, 'startup_error') && !has_key(self, 'capabilities')
     sleep 10m
   endwhile
-  if has_key(self, 'capabilities') || has_key(self, 'client_id')
+  if has_key(self, 'capabilities')
     return ''
   else
     return get(self, 'startup_error', 'Something unexpected went wrong spawning the agent')
@@ -453,8 +499,6 @@ endfunction
 function! copilot#agent#New(...) abort
   let opts = a:0 ? a:1 : {}
   let instance = {'requests': {},
-        \ 'methods': get(opts, 'methods', {}),
-        \ 'notifications': get(opts, 'notifications', {}),
         \ 'editorConfiguration': get(opts, 'editorConfiguration', {}),
         \ 'Close': function('s:AgentClose'),
         \ 'Notify': function('s:AgentNotify'),
@@ -463,28 +507,50 @@ function! copilot#agent#New(...) abort
         \ 'Cancel': function('s:AgentCancel'),
         \ 'StartupError': function('s:AgentStartupError'),
         \ }
+  let instance.methods = extend({
+        \ 'LogMessage': function('s:LogMessage'),
+        \ 'window/logMessage': function('s:LogMessage'),
+        \ }, get(opts, 'methods', {}))
   let [command, node_version, command_error] = s:Command()
   if len(command_error)
-    let instance.id = -1
-    let instance.startup_error = command_error
-    return instance
+    if empty(command)
+      let instance.id = -1
+      let instance.startup_error = command_error
+      return instance
+    else
+      let instance.node_version_warning = command_error
+    endif
   endif
-  let instance.node_version = node_version
+  if !empty(node_version)
+    let instance.node_version = node_version
+  endif
   if has('nvim')
     call extend(instance, {
         \ 'Close': function('s:LspClose'),
         \ 'Notify': function('s:LspNotify'),
         \ 'Request': function('s:LspRequest')})
-    let instance.client_id = v:lua.require'_copilot'.lsp_start_client(command, keys(instance.notifications) + keys(instance.methods) + ['LogMessage'])
+    let instance.client_id = eval("v:lua.require'_copilot'.lsp_start_client(command, keys(instance.methods))")
     let instance.id = instance.client_id
   else
     let state = {'headers': {}, 'mode': 'headers', 'buffer': ''}
-    let instance.job = copilot#job#Stream(command,
-          \ function('s:OnOut', [instance, state]),
-          \ function('s:OnErr', [instance]),
-          \ function('s:OnExit', [instance]))
+    let instance.open_buffers = {}
+    let instance.methods = extend({'window/showMessageRequest': function('s:ShowMessageRequest')}, instance.methods)
+    let instance.job = job_start(command, {
+          \ 'cwd': copilot#job#Cwd(),
+          \ 'in_mode': 'lsp',
+          \ 'out_mode': 'lsp',
+          \ 'out_cb': { j, d -> timer_start(0, function('s:OnMessage', [instance, d])) },
+          \ 'err_cb': { j, d -> timer_start(0, function('s:OnErr', [instance, d])) },
+          \ 'exit_cb': { j, d -> timer_start(0, function('s:OnExit', [instance, d])) },
+          \ })
     let instance.id = exists('*jobpid') ? jobpid(instance.job) : job_info(instance.job).process
-    let request = instance.Request('initialize', {'capabilities': {'workspace': {'workspaceFolders': v:true}}}, function('s:GetCapabilitiesResult'), function('s:GetCapabilitiesError'), instance)
+    let capabilities = {'workspace': {'workspaceFolders': v:true}, 'copilot': {}}
+    for name in keys(instance.methods)
+      if name =~# '^copilot/'
+        let capabilities.copilot[matchstr(name, '/\zs.*')] = v:true
+      endif
+    endfor
+    let request = instance.Request('initialize', {'capabilities': capabilities}, function('s:GetCapabilitiesResult'), function('s:GetCapabilitiesError'), instance)
   endif
   let s:instances[instance.id] = instance
   return instance
@@ -518,3 +584,23 @@ function! copilot#agent#Error(request, callback) abort
     let a:request.waiting[timer_start(0, function('s:Callback', [a:request, 'error', a:callback]))] = 1
   endif
 endfunction
+
+function! s:CloseBuffer(bufnr) abort
+  for instance in values(s:instances)
+    try
+      if has_key(instance, 'job') && has_key(instance.open_buffers, a:bufnr)
+        let buffer = remove(instance.open_buffers, a:bufnr)
+        call instance.Notify('textDocument/didClose', {'textDocument': {'uri': buffer.uri}})
+      endif
+    catch
+      call copilot#logger#Exception()
+    endtry
+  endfor
+endfunction
+
+augroup copilot_agent
+  autocmd!
+  if !has('nvim')
+    autocmd BufUnload * call s:CloseBuffer(+expand('<abuf>'))
+  endif
+augroup END
